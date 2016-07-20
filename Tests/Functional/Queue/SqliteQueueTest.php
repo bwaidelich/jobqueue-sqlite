@@ -1,5 +1,5 @@
 <?php
-namespace Flownative\Jobqueue\Sqlite\Tests\Functional\Queue;
+namespace Flownative\JobQueue\Sqlite\Tests\Functional\Queue;
 
 /*
  * This file is part of the Flownative.Jobqueue.Sqlite package.
@@ -11,131 +11,21 @@ namespace Flownative\Jobqueue\Sqlite\Tests\Functional\Queue;
  * source code.
  */
 
-use Flownative\Jobqueue\Sqlite\Queue\SqliteQueue;
-use TYPO3\Flow\Configuration\ConfigurationManager;
-use TYPO3\Jobqueue\Common\Queue\Message;
+use Flownative\JobQueue\Sqlite\Queue\SqliteQueue;
+use Flowpack\JobQueue\Common\Tests\Functional\AbstractQueueTest;
 
 /**
  * Functional test for SqliteQueue
  */
-class SqliteQueueTest extends \TYPO3\Flow\Tests\FunctionalTestCase
+class SqliteQueueTest extends AbstractQueueTest
 {
-    /**
-     * @var SqliteQueue
-     */
-    protected $queue;
 
     /**
-     * Set up dependencies
-     *
-     * @return void
+     * @inheritdoc
      */
-    public function setUp()
+    protected function getQueue()
     {
-        parent::setUp();
-
-        $options = ['storageFolder' => FLOW_PATH_DATA . 'Temporary/SqliteQueue/'];
-        $this->queue = new SqliteQueue('Test queue', $options);
+        return new SqliteQueue('Test-queue', $this->queueSettings);
     }
 
-    /**
-     * Clean up queue
-     *
-     * @return void
-     */
-    public function tearDown()
-    {
-        $this->queue->flushQueue();
-    }
-
-    /**
-     * @test
-     */
-    public function publishAndWaitWithMessageWorks()
-    {
-        $message = new Message('Yeah, tell someone it works!');
-        $this->queue->submit($message);
-
-        $result = $this->queue->waitAndTake(1);
-        $this->assertNotNull($result, 'wait should receive message');
-        $this->assertEquals($message->getPayload(), $result->getPayload(), 'message should have payload as before');
-    }
-
-    /**
-     * @test
-     */
-    public function waitForMessageTimesOut()
-    {
-        $result = $this->queue->waitAndTake(1);
-        $this->assertNull($result, 'wait should return NULL after timeout');
-    }
-
-    /**
-     * @test
-     */
-    public function peekReturnsNextMessagesIfQueueHasMessages()
-    {
-        $message = new Message('First message');
-        $this->queue->submit($message);
-        $message = new Message('Another message');
-        $this->queue->submit($message);
-
-        $results = $this->queue->peek(1);
-        $this->assertEquals(1, count($results), 'peek should return a message');
-        $result = $results[0];
-        $this->assertEquals('First message', $result->getPayload());
-        $this->assertEquals(Message::STATE_SUBMITTED, $result->getState());
-
-        $results = $this->queue->peek(1);
-        $this->assertEquals(1, count($results), 'peek should return a message again');
-        $result = $results[0];
-        $this->assertEquals('First message', $result->getPayload(), 'second peek should return the same message again');
-    }
-
-    /**
-     * @test
-     */
-    public function peekReturnsNullIfQueueHasNoMessage()
-    {
-        $result = $this->queue->peek();
-        $this->assertEquals(array(), $result, 'peek should not return a message');
-    }
-
-    /**
-     * @test
-     */
-    public function waitAndReserveWithFinishRemovesMessage()
-    {
-        $message = new Message('First message');
-        $this->queue->submit($message);
-
-        $result = $this->queue->waitAndReserve(1);
-        $this->assertNotNull($result, 'waitAndReserve should receive message');
-        $this->assertEquals($message->getPayload(), $result->getPayload(), 'message should have payload as before');
-
-        $result = $this->queue->peek();
-        $this->assertEquals(array(), $result, 'no message should be present in queue');
-
-        $finishResult = $this->queue->finish($message);
-        $this->assertTrue($finishResult);
-    }
-
-    /**
-     * @test
-     */
-    public function identifierMakesMessagesUnique()
-    {
-        $message = new \TYPO3\Jobqueue\Common\Queue\Message('Yeah, tell someone it works!', 'test.message');
-        $identicalMessage = new \TYPO3\Jobqueue\Common\Queue\Message('Yeah, tell someone it works!', 'test.message');
-        $this->queue->submit($message);
-        $this->queue->submit($identicalMessage);
-
-        $this->assertEquals(\TYPO3\Jobqueue\Common\Queue\Message::STATE_NEW, $identicalMessage->getState());
-
-        $result = $this->queue->waitAndTake(1);
-        $this->assertNotNull($result, 'wait should receive message');
-
-        $result = $this->queue->waitAndTake(1);
-        $this->assertNull($result, 'message should not be queued twice');
-    }
 }

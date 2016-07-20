@@ -1,0 +1,7 @@
+Flownative:
+  JobQueue:
+    Sqlite:
+      testing:
+        # Set to TRUE to enable functional testing against a database server
+        # enabled: TRUE
+        storageFolder: '%FLOW_PATH_DATA%Temporary/SqliteQueue/'

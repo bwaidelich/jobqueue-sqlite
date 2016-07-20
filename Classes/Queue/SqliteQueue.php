@@ -1,8 +1,8 @@
 <?php
-namespace Flownative\Jobqueue\Sqlite\Queue;
+namespace Flownative\JobQueue\Sqlite\Queue;
 
 /*
- * This file is part of the Flownative.Jobqueue.Sqlite package.
+ * This file is part of the Flownative.JobQueue.Sqlite package.
  *
  * (c) Contributors to the package
  *
@@ -11,9 +11,11 @@ namespace Flownative\Jobqueue\Sqlite\Queue;
  * source code.
  */
 
+use Flowpack\JobQueue\Common\Exception as JobQueueException;
+use Flowpack\JobQueue\Common\Queue\Message;
+use Flowpack\JobQueue\Common\Queue\QueueInterface;
 use TYPO3\Flow\Annotations as Flow;
-use TYPO3\Jobqueue\Common\Queue\Message;
-use TYPO3\Jobqueue\Common\Queue\QueueInterface;
+use TYPO3\Flow\Utility\Files;
 
 /**
  * A queue implementation using Sqlite as the queue backend
@@ -41,13 +43,11 @@ class SqliteQueue implements QueueInterface
     protected $defaultTimeout = 60;
 
     /**
-     * Constructor
-     *
      * @param string $name
      * @param array $options
-     * @throws \TYPO3\Jobqueue\Common\Exception
+     * @throws JobQueueException
      */
-    public function __construct($name, array $options = array())
+    public function __construct($name, array $options = [])
     {
         $this->name = $name;
 
@@ -56,7 +56,7 @@ class SqliteQueue implements QueueInterface
         }
 
         if (!isset($options['storageFolder'])) {
-            throw new \TYPO3\Jobqueue\Common\Exception('No storageFolder configured for SqliteQueue.', 1445527553);
+            throw new JobQueueException('No storageFolder configured for SqliteQueue.', 1445527553);
         }
         $this->storageFolder = $options['storageFolder'];
     }
@@ -66,48 +66,35 @@ class SqliteQueue implements QueueInterface
      *
      * @return void
      */
-    protected function initializeObject()
+    public function initializeObject()
     {
-        $databaseFilePath = $this->storageFolder . md5($this->name) . '.db';
-        $createDatabaseTables = FALSE;
+        $databaseFilePath = Files::concatenatePaths([$this->storageFolder, md5($this->name) . '.db']);
+        $createDatabaseTables = false;
         if (!is_file($databaseFilePath)) {
             if (!is_dir($this->storageFolder)) {
-                mkdir($this->storageFolder, 0777, TRUE);
+                Files::createDirectoryRecursively($this->storageFolder);
             }
-            $createDatabaseTables = TRUE;
+            $createDatabaseTables = true;
         }
         $this->connection = new \SQLite3($databaseFilePath);
         if ($createDatabaseTables) {
-            $this->createQueueTables();
+            $this->createQueueTable();
         }
     }
 
     /**
-     * Publish a message to the queue
-     *
-     * @param Message $message
-     * @return void
+     * @inheritdoc
      */
-    public function submit(Message $message)
+    public function submit($payload, array $options = [])
     {
-
-        if ($message->getIdentifier() !== NULL) {
-            $preparedStatement = $this->connection->prepare('SELECT rowid FROM queue WHERE msgid=:msgid');
-            $preparedStatement->bindValue(':msgid', $message->getIdentifier());
-            $result = $preparedStatement->execute();
-            if ($result->fetchArray(SQLITE3_NUM) !== FALSE) {
-                return;
-            }
+        $preparedStatement = $this->connection->prepare('INSERT INTO queue (payload, state) VALUES (:payload, :state);');
+        $preparedStatement->bindValue(':payload', json_encode($payload));
+        $preparedStatement->bindValue(':state', 'ready');
+        $success = $preparedStatement->execute();
+        if ($success === false) {
+            return null;
         }
-
-        $encodedMessage = $this->encodeMessage($message);
-
-        $preparedStatement = $this->connection->prepare('INSERT INTO queue (msgid, payload) VALUES (:msgid, :payload);');
-        $preparedStatement->bindValue(':msgid', $message->getIdentifier());
-        $preparedStatement->bindValue(':payload', $encodedMessage);
-        $preparedStatement->execute();
-        $message->setIdentifier($this->connection->lastInsertRowID());
-        $message->setState(Message::STATE_SUBMITTED);
+        return (string)$this->connection->lastInsertRowID();
     }
 
     /**
@@ -118,27 +105,12 @@ class SqliteQueue implements QueueInterface
      */
     public function waitAndTake($timeout = null)
     {
-        $timeout = ($timeout !== null ? $timeout : $this->defaultTimeout);
-
-        for ($time = 0; $time < $timeout; $time++) {
-            $row = @$this->connection->querySingle('SELECT rowid, payload FROM queue ORDER BY rowid ASC LIMIT 1', true);
-            if ($row !== []) {
-                $preparedDelete = $this->connection->prepare('DELETE FROM queue WHERE rowid=:rowid');
-                $preparedDelete->bindValue(':rowid', $row['rowid']);
-                $preparedDelete->execute();
-
-                $message = $this->decodeMessage($row['payload']);
-                $message->setIdentifier($row['rowid']);
-
-                // The message is marked as done
-                $message->setState(Message::STATE_DONE);
-
-                return $message;
-            }
-
-            sleep(1);
+        $message = $this->reserveMessage($timeout);
+        if ($message === null) {
+            return null;
         }
-        return null;
+        $this->connection->exec('DELETE FROM queue WHERE id = ' . (integer)$message->getIdentifier());
+        return $message;
     }
 
     /**
@@ -149,54 +121,41 @@ class SqliteQueue implements QueueInterface
      */
     public function waitAndReserve($timeout = null)
     {
-        $timeout = ($timeout !== null ? $timeout : $this->defaultTimeout);
-
-        for ($time = 0; $time < $timeout; $time++) {
-            $row = @$this->connection->querySingle('SELECT rowid, payload FROM queue ORDER BY rowid ASC LIMIT 1', true);
-            if ($row !== []) {
-                $message = $this->decodeMessage($row['payload']);
-                $message->setIdentifier($row['rowid']);
-
-                $encodedMessage = $this->encodeMessage($message);
-
-                $preparedDelete = $this->connection->prepare('DELETE FROM queue WHERE rowid=:rowid');
-                $preparedDelete->bindValue(':rowid', $row['rowid']);
-
-                $preparedInsert = $this->connection->prepare('INSERT INTO processing (rowid, payload) VALUES (:rowid, :payload)');
-                $preparedInsert->bindValue(':rowid', $row['rowid']);
-                $preparedInsert->bindValue(':payload', $encodedMessage);
-
-                try {
-                    $this->connection->query('BEGIN IMMEDIATE TRANSACTION');
-                    $preparedDelete->execute();
-                    $preparedInsert->execute();
-                    $this->connection->query('COMMIT');
-                } catch (\Exception $exception) {
-                    $this->connection->query('ROLLBACK');
-                }
-
-                return $message;
-            }
-
-            sleep(1);
-        }
-
-        return null;
+        return $this->reserveMessage($timeout);
     }
 
     /**
-     * Mark a message as finished
-     *
-     * @param Message $message
-     * @return boolean TRUE if the message could be removed
+     * @param integer $timeout
+     * @return Message
      */
-    public function finish(Message $message)
+    protected function reserveMessage($timeout = null)
     {
-        $success = $this->connection->exec('DELETE FROM processing WHERE rowid=' . (int)$message->getIdentifier());
-        if ($success) {
-            $message->setState(Message::STATE_DONE);
+        if ($timeout === null) {
+            $timeout = $this->defaultTimeout;
         }
-        return $success;
+        $startTime = time();
+        do {
+            $row = @$this->connection->querySingle('SELECT id, payload FROM queue WHERE state = "submitted" ORDER BY id ASC LIMIT 1', true);
+            if (time() - $startTime >= $timeout) {
+                return null;
+            }
+            if ($row !== []) {
+                $this->connection->exec('UPDATE queue SET state = "reserved" WHERE id = ' . (integer)$row['id'] . ' AND state = "submitted"');
+                if ($this->connection->changes() === 1) {
+                    return $this->getMessageFromRow($row);
+                }
+            }
+            sleep(1);
+        } while (true);
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function finish($messageId)
+    {
+        $this->connection->exec('DELETE FROM queue WHERE id=' . (int)$messageId);
+        return $this->connection->changes() === 1;
     }
 
     /**
@@ -207,99 +166,95 @@ class SqliteQueue implements QueueInterface
      */
     public function peek($limit = 1)
     {
+        $result = $this->connection->query('SELECT * FROM queue WHERE state = "submitted" ORDER BY id ASC LIMIT ' . (int)$limit);
         $messages = [];
-        $result = $this->connection->query('SELECT * FROM queue ORDER BY rowid ASC LIMIT ' . (int)$limit);
         while ($resultRow = $result->fetchArray(SQLITE3_ASSOC)) {
-            $message = $this->decodeMessage($resultRow['payload']);
-            // The message is still published and should not be processed!
-            $message->setState(Message::STATE_SUBMITTED);
-            $messages[] = $message;
+            $messages[] = $this->getMessageFromRow($resultRow);
         }
-
         return $messages;
     }
 
     /**
-     * Count messages in the queue
-     *
-     * @return integer
+     * @inheritdoc
      */
     public function count()
     {
-        return $this->connection->querySingle('SELECT COUNT(rowid) FROM queue');
+        return (integer)$this->connection->querySingle('SELECT COUNT(id) FROM queue WHERE state = "submitted"');
     }
 
     /**
-     * Flushes the queue. Danger, all queued items will be lost.
+     * @return string
+     */
+    public function getName()
+    {
+        return $this->name;
+    }
+
+    /**
+     * Puts a reserved message back to the queue
      *
+     * @param string $messageId
+     * @param array $options Simple key/value array with options that can be interpreted by the concrete implementation (optional)
+     * @return void
+     */
+    public function release($messageId, array $options = [])
+    {
+        // TODO: Implement release() method.
+    }
+
+    /**
+     * Removes a message from the active queue and marks it failed (bury)
+     *
+     * @param string $messageId
+     * @return void
+     */
+    public function abort($messageId)
+    {
+        // TODO: Implement abort() method.
+    }
+
+    /**
+     * @return void
+     */
+    protected function createQueueTable()
+    {
+        $this->connection->exec('CREATE TABLE queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload TEXT,
+            state TEXT,
+            failures INTEGER DEFAULT 0
+        );');
+    }
+
+
+    /**
+     * @param array $row
+     * @return Message
+     */
+    protected function getMessageFromRow(array $row)
+    {
+        return new Message($row['id'], json_decode($row['payload'], true), 0);
+    }
+
+    /**
+     * @return void
+     */
+    public function setUp()
+    {
+        // TODO: Implement setUp() method.
+    }
+
+    /**
+     * Removes all messages from this queue
+     *
+     * Danger, all queued items will be lost!
      * This is a method primarily used in testing, not part of the API.
      *
      * @return void
      */
-    public function flushQueue()
+    public function flush()
     {
-        $databaseFilePath = $this->storageFolder . md5($this->name) . '.db';
-        if (file_exists($databaseFilePath)) {
-            unlink($databaseFilePath);
-        }
-        $this->initializeObject();
-    }
-
-    /**
-     * @return void
-     */
-    protected function createQueueTables()
-    {
-        $this->connection->exec('CREATE TABLE queue (
-            rowid INTEGER PRIMARY KEY AUTOINCREMENT,
-            msgid VARCHAR,
-            payload VARCHAR
-        );');
-        $this->connection->exec('CREATE TABLE processing (
-            payload VARCHAR
-        );');
-    }
-
-    /**
-     * Encode a message
-     *
-     * Updates the original value property of the message to resemble the
-     * encoded representation.
-     *
-     * @param Message $message
-     * @return string
-     */
-    protected function encodeMessage(Message $message)
-    {
-        $value = json_encode($message->toArray());
-        $message->setOriginalValue($value);
-        return $value;
-    }
-
-    /**
-     * Decode a message from a string representation
-     *
-     * @param string $value
-     * @return Message
-     */
-    protected function decodeMessage($value)
-    {
-        $decodedMessage = json_decode($value, true);
-        $message = new Message($decodedMessage['payload']);
-        if (isset($decodedMessage['identifier'])) {
-            $message->setIdentifier($decodedMessage['identifier']);
-        }
-        $message->setOriginalValue($value);
-        return $message;
-    }
-
-    /**
-     *
-     * @param string $identifier
-     * @return Message
-     */
-    public function getMessage($identifier)
-    {
-        return null;
+        $databaseFilePath = Files::concatenatePaths([$this->storageFolder, md5($this->name) . '.db']);
+        Files::unlink($databaseFilePath);
     }
 }
